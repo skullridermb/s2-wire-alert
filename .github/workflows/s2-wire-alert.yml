@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 minutes (GitHub may start runs a few minutes late)
   workflow_dispatch:           # adds a "Run workflow" button for manual runs
+    inputs:
+      test_alert:
+        description: "Also send a test alert"
+        type: choice
+        options: [none, priority, urgent]
+        default: none
 
 permissions:
   contents: write              # lets the job save the seen-episodes list back to the repo
@@ -21,8 +27,24 @@ jobs:
       - name: Check feed and send alerts
         shell: pwsh
         env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          PUSHOVER_SOUND: ${{ vars.PUSHOVER_SOUND }}
+          PUSHOVER_SOUND_URGENT: ${{ vars.PUSHOVER_SOUND_URGENT }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: ./s2-wire-alert.ps1
+
+      - name: Send test alert
+        if: github.event_name == 'workflow_dispatch' && inputs.test_alert != 'none'
+        shell: pwsh
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          PUSHOVER_SOUND: ${{ vars.PUSHOVER_SOUND }}
+          PUSHOVER_SOUND_URGENT: ${{ vars.PUSHOVER_SOUND_URGENT }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if ("${{ inputs.test_alert }}" -eq "urgent") { ./s2-wire-alert.ps1 -Test -Urgent } else { ./s2-wire-alert.ps1 -Test }
 
       - name: Save seen episodes
         run: |
