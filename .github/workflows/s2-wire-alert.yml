@@ -1,0 +1,33 @@
+name: S2 Wire alert
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may start runs a few minutes late)
+  workflow_dispatch:           # adds a "Run workflow" button for manual runs
+
+permissions:
+  contents: write              # lets the job save the seen-episodes list back to the repo
+
+concurrency:
+  group: s2-wire-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check feed and send alerts
+        shell: pwsh
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: ./s2-wire-alert.ps1
+
+      - name: Save seen episodes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
+          git add s2-wire-seen.txt
+          git diff --cached --quiet || git commit -m "Update seen episodes"
+          git push
