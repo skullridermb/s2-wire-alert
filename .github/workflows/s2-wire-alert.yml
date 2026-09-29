@@ -22,7 +22,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check feed and send alerts
         shell: pwsh
@@ -47,9 +47,10 @@ jobs:
           if ("${{ inputs.test_alert }}" -eq "urgent") { ./s2-wire-alert.ps1 -Test -Urgent } else { ./s2-wire-alert.ps1 -Test }
 
       - name: Save seen episodes
+        if: always()   # save progress even if an alert failed, so successes are not re-sent
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
           git add s2-wire-seen.txt
           git diff --cached --quiet || git commit -m "Update seen episodes"
-          git push
+          git push || (git pull --rebase && git push)

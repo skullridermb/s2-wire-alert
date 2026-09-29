@@ -62,52 +62,109 @@ function Send-Pushover($title, $body, $level, $link) {
     Invoke-RestMethod -Method Post -Uri "https://api.pushover.net/1/messages.json" -Body $form | Out-Null
 }
 
-function Send-Alert($title, $body, $level, $link) {
-    if ($UsePushover) { Send-Pushover $title $body $level $link }
-    if ($UseNtfy)     { Send-Ntfy     $title $body $level $link }
+$Channels = @()
+if ($UsePushover) { $Channels += "pushover" }
+if ($UseNtfy)     { $Channels += "ntfy" }
+
+# Tries one channel; a failure is reported but never stops the other channels.
+function Try-Send($name, $title, $body, $level, $link) {
+    $ErrorActionPreference = "Stop"
+    try {
+        switch ($name) {
+            "pushover" { Send-Pushover $title $body $level $link }
+            "ntfy"     { Send-Ntfy     $title $body $level $link }
+        }
+        return $true
+    } catch {
+        # Write-Host, not Write-Output: output would become part of the return value.
+        Write-Host "::warning::$name failed for '$title': $($_.Exception.Message)"
+        return $false
+    }
 }
 
 if ($Test) {
     $level = if ($Urgent) { "urgent" } else { "high" }
-    Send-Alert "S2 Wire alert test" "If you see this, alerts are working." $level $null
-    Write-Output "Test sent via: $(@(if ($UsePushover) {'Pushover'}; if ($UseNtfy) {'ntfy'}) -join ', ')"
+    $failed = @()
+    foreach ($name in $Channels) {
+        if (Try-Send $name "S2 Wire alert test" "If you see this, alerts are working." $level $null) {
+            Write-Output "Test sent via $name"
+        } else { $failed += $name }
+    }
+    if ($failed) { exit 1 }
     return
 }
 
 [xml]$feed = (Invoke-WebRequest -Uri $FeedUrl -UseBasicParsing).Content
 $items = $feed.rss.channel.item
 
+# State file: one line per record, kept forever (never rebuilt from the feed).
+#   <guid>            episode fully handled (sent on every channel, or not a match)
+#   <channel>|<guid>  episode delivered on that channel, others still pending
 $firstRun = -not (Test-Path $StateFile)
-$seen = if ($firstRun) { @() } else { Get-Content $StateFile }
+$state = [System.Collections.Generic.List[string]]::new()
+if (-not $firstRun) { Get-Content $StateFile | Where-Object { $_ } | ForEach-Object { $state.Add($_) } }
+$known = [System.Collections.Generic.HashSet[string]]::new([string[]]$state)
+
+function Remember($line) { if ($known.Add($line)) { $state.Add($line) } }
 
 $pattern = "\b(" + ($Keywords -join "|") + ")\b"
-$newSeen = @()
+$giveUpAfter = [TimeSpan]::FromHours(24)
+$anyFailed = $false
 
 foreach ($item in $items) {
     $id = if ($item.guid.'#text') { $item.guid.'#text' } else { [string]$item.guid }
-    $newSeen += $id
-    if ($seen -contains $id) { continue }
+    if (-not $id -or $known.Contains($id)) { continue }
 
     # Items carry both <title> and <itunes:title>; take the first.
     $title = [string](@($item.title)[0])
-    if ($title -notmatch "^The Wire" -or $title -notmatch $pattern) { continue }
+    if ($title -notmatch "^The Wire" -or $title -notmatch $pattern) {
+        if (-not $DryRun) { Remember $id }
+        continue
+    }
 
     $level = if ($title -match "\b(Flash|Urgent)\b") { "urgent" } else { "high" }
     $link  = [string]$item.link
     $desc  = ([string]$item.description) -replace "<[^>]+>", " " -replace "\s+", " "
     if ($desc.Length -gt 300) { $desc = $desc.Substring(0, 300) + "..." }
 
-    if ($DryRun) {
-        Write-Output "[match] $title"
-    } elseif ($firstRun) {
+    if ($DryRun) { Write-Output "[match] $title"; continue }
+    if ($firstRun) {
         # Don't blast old episodes the very first time; just remember them.
         Write-Output "[first run, skipped] $title"
+        Remember $id
+        continue
+    }
+
+    # Send on each channel that hasn't delivered this episode yet.
+    $pending = @($Channels | Where-Object { -not $known.Contains("$_|$id") })
+    foreach ($name in $pending) {
+        if (Try-Send $name $title $desc $level $link) {
+            Write-Output "[sent via $name] $title"
+            Remember "$name|$id"
+        }
+    }
+
+    $stillPending = @($Channels | Where-Object { -not $known.Contains("$_|$id") })
+    if (-not $stillPending) {
+        Remember $id
     } else {
-        Send-Alert $title $desc $level $link
-        Write-Output "[sent] $title"
+        # Retry on the next run, but stop retrying a day after the episode came out.
+        $published = try { [DateTimeOffset]::Parse([string]$item.pubDate) } catch { [DateTimeOffset]::MinValue }
+        if ([DateTimeOffset]::UtcNow - $published -gt $giveUpAfter) {
+            Write-Output "::warning::Giving up on $($stillPending -join ', ') for '$title' (older than 24h)"
+            Remember $id
+        } else {
+            $anyFailed = $true
+        }
     }
 }
 
 if (-not $DryRun) {
-    $newSeen | Select-Object -Unique | Set-Content $StateFile
+    # Monthly heartbeat line keeps the repo active even if S2 stops posting,
+    # so GitHub never pauses the schedule for 60 days of inactivity.
+    Remember ("heartbeat|" + [DateTime]::UtcNow.ToString("yyyy-MM"))
+    $state | Set-Content $StateFile
 }
+
+# Fail the run (GitHub emails you) if any alert is still waiting to be retried.
+if ($anyFailed) { exit 1 }
